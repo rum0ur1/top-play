@@ -1,0 +1,82 @@
+.artwork {
+    border-radius: 8px;
+    background-size: cover;
+}
+
+.search-entry {
+    margin: 5px;
+    padding: 4px;
+    width: 200px;
+    border-radius: 6px;
+}
+
+.search-result {
+    margin-left: 10px;
+    color: #ccc;
+}
+
+.control-button {
+    margin: 0 10px;
+}
+
+.cover-art {
+    background-color: #666;
+    border-radius: 4px;
+    width: 48px;
+    height: 48px;
+    margin-right: 10px;
+}
+
+.search-result-row {
+    margin: 6px 0;
+    padding: 4px;
+}
+
+.song-name {
+    font-weight: bold;
+    font-size: 12pt;
+}
+
+.artist-name {
+    font-size: 9pt;
+    color: #aaa;
+}
+
+.duration {
+    font-size: 9pt;
+    color: #ccc;
+    margin-left: 10px;
+}
+
+.cover-art {
+    background-repeat: no-repeat;
+    background-size: cover;
+}
+
+.result-row {
+    padding: 6px;
+    border-radius: 6px;
+    margin-bottom: 4px;
+    transition: background 150ms ease-in-out;
+}
+
+.result-row:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+
+.overlay-style {
+    width: 24px;
+    height: 24px;
+    background-size: contain;
+    border-radius: 4px;
+    opacity: 0.6;
+}
+
+.overlay-wrapper-style {
+    width: 26px;
+    height: 26px;
+    padding: 6px;
+    border-radius: 4px;
+    background-color: rgba(0, 0, 0, 0.49);
+}

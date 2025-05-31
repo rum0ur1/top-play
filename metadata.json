@@ -1,0 +1,11 @@
+{
+  "name": "TOP PLAY",
+  "description": "Play songs from JioSaavn in the top bar via the jiosaavn-api-privatecvc2.vercel.app proxy",
+  "uuid": "topplay@dnarrator",
+  "version": "1",
+  "shell-version": ["40", "41", "42", "43", "44"],
+  "stylesheet": "stylesheet.css",
+  "dependencies": ["gst"],
+  "url": "https://github.com/rum0ur1/top-play"
+}
+
