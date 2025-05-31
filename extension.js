@@ -254,6 +254,37 @@ class Indicator extends PanelMenu.Button {
             row._songNameActor = songName;
             if (this._currentPlayingId === r.id) {
                 songName.set_style("font-weight:bold; font-size:12pt; color:#38c739;");
+
+                // restore animated overlay
+                let image = new St.Icon({
+                    gicon: null,
+                    icon_size: 24,
+                    x_align: Clutter.ActorAlign.CENTER,
+                    y_align: Clutter.ActorAlign.CENTER,
+                });
+
+                let wrapper = new St.Bin({
+                    x_expand: true,
+                    y_expand: true,
+                    x_align: Clutter.ActorAlign.CENTER,
+                    y_align: Clutter.ActorAlign.CENTER,
+                    style: "width:26px; height:26px; padding: 6px; border-radius:4px; background-color: rgba(0, 0, 0, 0.49)",
+                });
+
+                wrapper.set_child(image);
+                cover.add_child(wrapper);
+
+                let idx = 0;
+                let timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 30, () => {
+                    image.set_gicon(new Gio.FileIcon({
+                        file: Gio.File.new_for_path(`${Me.dir.get_path()}/icons/soundbar-frames/frame_${String(idx + 1).padStart(3, "0")}.png`)
+                    }));
+                    idx = (idx + 1) % FRAME_COUNT;
+                    return GLib.SOURCE_CONTINUE;
+                });
+
+                this._currentOverlay = { wrapper, timeoutId };
+
             }
 
             row.connect("button-press-event", () => {
