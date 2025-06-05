@@ -6,9 +6,10 @@ const Main = imports.ui.main;
 const PanelMenu = imports.ui.panelMenu;
 const ExtensionUtils = imports.misc.extensionUtils;
 const Me = imports.misc.extensionUtils.getCurrentExtension();
+
 let themeContext = St.ThemeContext.get_for_stage(global.stage);
 let cssFile = Me.dir.get_child('stylesheet.css');
-St.ThemeContext.get_for_stage(global.stage).get_theme().load_stylesheet(cssFile);
+themeContext.get_theme().load_stylesheet(cssFile);
 
 const GETTEXT_DOMAIN = "my-indicator-extension";
 const _ = ExtensionUtils.gettext;
@@ -16,6 +17,7 @@ const _ = ExtensionUtils.gettext;
 const FRAME_COUNT = 30;
 var framePixbufs = [];
 
+// Preload all frames
 for (let i = 1; i <= FRAME_COUNT; i++) {
     let name = `frame_${String(i).padStart(3, "0")}.png`;
     let filePath = `${Me.dir.get_path()}/icons/soundbar-frames/${name}`;
@@ -30,7 +32,6 @@ for (let i = 1; i <= FRAME_COUNT; i++) {
 
 // --------------------------------------------------------------------------------
 // Indicator: the panel button + dropdown menu
-// WOrking Final
 // --------------------------------------------------------------------------------
 var Indicator = GObject.registerClass(
 class Indicator extends PanelMenu.Button {
@@ -44,12 +45,10 @@ class Indicator extends PanelMenu.Button {
         this._searchTimeout = null;
         this._spinLoopId = null;
         this._spinnerBin = null;
-        this._currentPlayingRow = null;
-        this._currentPlayingId = null;
+        this._currentOverlay = null;    // { wrapper, timeoutId }
+        this._currentPlayingId = null;  // ID of the currently playing song
 
-        for (let i = 0; i < FRAME_COUNT; i++) {
-            let _ = new Gio.FileIcon({ file: Gio.File.new_for_path(`${Me.dir.get_path()}/icons/soundbar-frames/frame_${String(i+1).padStart(3,"0")}.png`) });
-        }        
+        this._rowTimeouts = [];         // track all per-row timeouts
 
         // Top-bar icon
         this.icon = new St.Icon({
@@ -159,7 +158,7 @@ class Indicator extends PanelMenu.Button {
             let q = searchEntry.get_text().trim();
             if (!q) {
                 this._destroySpinner();
-                this.resultsBox.destroy_all_children();
+                this._clearAllRows();
                 GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
                     this.scrollView.ease({ height: 0, duration: 250, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
                     return GLib.SOURCE_REMOVE;
@@ -185,39 +184,81 @@ class Indicator extends PanelMenu.Button {
         });
     }
 
+    // Helper: cancel all row-level timeouts and clear children
+    _clearAllRows() {
+        for (let id of this._rowTimeouts) {
+            GLib.source_remove(id);
+        }
+        this._rowTimeouts = [];
+        this.resultsBox.destroy_all_children();
+    }
+
     // Remove timeouts/loops on destroy
     destroy() {
+        // Cancel search debounce
         if (this._searchTimeout) {
             GLib.source_remove(this._searchTimeout);
             this._searchTimeout = null;
         }
+
+        // Cancel progress-tracking
         if (this.progressId) {
             GLib.source_remove(this.progressId);
             this.progressId = null;
         }
+
+        // Cancel spinner animation
         if (this._spinLoopId) {
             GLib.source_remove(this._spinLoopId);
             this._spinLoopId = null;
         }
+
+        // Cancel current overlay animation, if any
+        if (this._currentOverlay) {
+            if (this._currentOverlay.timeoutId) {
+                GLib.source_remove(this._currentOverlay.timeoutId);
+            }
+            if (this._currentOverlay.wrapper) {
+                this._currentOverlay.wrapper.destroy();
+            }
+            this._currentOverlay = null;
+        }
+
+        // Cancel any pending row-level timeouts and clear rows
+        this._clearAllRows();
+
         super.destroy();
     }
 
     _makeButton(iconName) {
-        let icon = new St.Icon({ icon_name: iconName, style_class: "popup-menu-icon", icon_size: 20 });
-        return new St.Button({ child: icon, style_class: "control-button", x_expand: true, x_align: Clutter.ActorAlign.CENTER });
+        let icon = new St.Icon({
+            icon_name: iconName,
+            style_class: "popup-menu-icon",
+            icon_size: 20
+        });
+        return new St.Button({
+            child: icon,
+            style_class: "control-button",
+            x_expand: true,
+            x_align: Clutter.ActorAlign.CENTER
+        });
     }
 
     _renderResults(results) {
-        this.resultsBox.destroy_all_children();
+        // 1) Cancel previous row-level timeouts and clear rows
+        this._clearAllRows();
 
+        // 2) Create each result row
         results.forEach((r, i) => {
             let artist = r.primaryArtists || "Unknown Artist";
             let dur = r.duration || 0;
-            let min = Math.floor(dur / 60), sec = dur % 60;
+            let min = Math.floor(dur / 60);
+            let sec = dur % 60;
             let durationText = `${min}:${sec.toString().padStart(2, "0")}`;
-            let imgSmall = r.image?.find(i => i.quality==="150x150")?.link;
-            let imgBig = r.image?.find(i => i.quality==="500x500")?.link;
+            let imgSmall = r.image?.find(i => i.quality === "150x150")?.link;
+            let imgBig = r.image?.find(i => i.quality === "500x500")?.link;
 
+            // Cover placeholder
             let cover = new St.BoxLayout({
                 x_align: Clutter.ActorAlign.CENTER,
                 y_align: Clutter.ActorAlign.CENTER,
@@ -229,13 +270,13 @@ class Indicator extends PanelMenu.Button {
                         background-color:#666;`
             });
 
+            // Song + artist labels
             let textBox = new St.BoxLayout({ vertical: true, x_expand: true });
-
             let songName = new St.Label({
                 text: r.name,
                 style: "font-weight:bold; font-size:12pt;",
             });
-            songName._origStyle = songName.get_style(); 
+            songName._origStyle = songName.get_style();
             let artistName = new St.Label({
                 text: artist,
                 style: "font-size:9pt; color:#aaa;",
@@ -243,26 +284,40 @@ class Indicator extends PanelMenu.Button {
             textBox.add_child(songName);
             textBox.add_child(artistName);
 
-            let durationLabel = new St.Label({ text: durationText, style:"font-size:9pt; color:#ccc; margin-left:10px;", x_expand:false, x_align:Clutter.ActorAlign.END });
+            // Duration label
+            let durationLabel = new St.Label({
+                text: durationText,
+                style: "font-size:9pt; color:#ccc; margin-left:10px;",
+                x_expand: false,
+                x_align: Clutter.ActorAlign.END
+            });
 
-            let row = new St.BoxLayout({ vertical:false, x_expand:true, reactive:true, can_focus:true, track_hover:true });
+            // Row container
+            let row = new St.BoxLayout({
+                vertical: false,
+                x_expand: true,
+                reactive: true,
+                can_focus: true,
+                track_hover: true
+            });
             row.set_style_class_name("result-row");
             row.add_child(cover);
             row.add_child(textBox);
             row.add_child(durationLabel);
 
+            // Store reference to reset style later
             row._songNameActor = songName;
+
+            // If this song was already playing, restore overlay
             if (this._currentPlayingId === r.id) {
                 songName.set_style("font-weight:bold; font-size:12pt; color:#38c739;");
 
-                // restore animated overlay
                 let image = new St.Icon({
                     gicon: null,
                     icon_size: 24,
                     x_align: Clutter.ActorAlign.CENTER,
                     y_align: Clutter.ActorAlign.CENTER,
                 });
-
                 let wrapper = new St.Bin({
                     x_expand: true,
                     y_expand: true,
@@ -270,40 +325,42 @@ class Indicator extends PanelMenu.Button {
                     y_align: Clutter.ActorAlign.CENTER,
                     style: "width:26px; height:26px; padding: 6px; border-radius:4px; background-color: rgba(0, 0, 0, 0.49)",
                 });
-
                 wrapper.set_child(image);
                 cover.add_child(wrapper);
 
                 let idx = 0;
-                let timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 30, () => {
-                    image.set_gicon(new Gio.FileIcon({
-                        file: Gio.File.new_for_path(`${Me.dir.get_path()}/icons/soundbar-frames/frame_${String(idx + 1).padStart(3, "0")}.png`)
-                    }));
+                let overlayTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 30, () => {
+                    let pixbuf = framePixbufs[idx];
+                    if (pixbuf) {
+                        image.set_gicon(new Gio.FileIcon({
+                            file: Gio.File.new_for_path(
+                                `${Me.dir.get_path()}/icons/soundbar-frames/frame_${String(idx + 1).padStart(3, "0")}.png`
+                            )
+                        }));
+                    }
                     idx = (idx + 1) % FRAME_COUNT;
                     return GLib.SOURCE_CONTINUE;
                 });
 
-                this._currentOverlay = { wrapper, timeoutId };
-
+                this._currentOverlay = { wrapper, timeoutId: overlayTimeout };
             }
 
+            // Click handler: start playback + animated overlay
             row.connect("button-press-event", () => {
-
+                // 1) Clear existing overlay if any
                 if (this._currentOverlay) {
                     GLib.source_remove(this._currentOverlay.timeoutId);
                     this._currentOverlay.wrapper.destroy();
                     this._currentOverlay = null;
                 }
-                
-                // 2) Create an icon to show the animation frames
+
+                // 2) Create new overlay for this row
                 let image = new St.Icon({
                     gicon: null,
                     icon_size: 24,
                     x_align: Clutter.ActorAlign.CENTER,
                     y_align: Clutter.ActorAlign.CENTER,
                 });
-                
-                // 3) Wrap with padding and styling
                 let wrapper = new St.Bin({
                     x_expand: true,
                     y_expand: true,
@@ -311,62 +368,76 @@ class Indicator extends PanelMenu.Button {
                     y_align: Clutter.ActorAlign.CENTER,
                     style: "width:26px; height:26px; padding: 6px; border-radius:4px; background-color: rgba(0, 0, 0, 0.49)",
                 });
-                
                 wrapper.set_child(image);
                 cover.add_child(wrapper);
-                
-                // 4) Animate through preloaded pixbufs
+
+                // 3) Animate through preloaded pixbufs
                 let idx = 0;
-                let timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 30, () => {
+                let overlayTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 30, () => {
                     let pixbuf = framePixbufs[idx];
-                    if (pixbuf)
-                        image.set_gicon(new Gio.FileIcon({ file: Gio.File.new_for_path(`${Me.dir.get_path()}/icons/soundbar-frames/frame_${String(idx + 1).padStart(3, "0")}.png`) }));
+                    if (pixbuf) {
+                        image.set_gicon(new Gio.FileIcon({
+                            file: Gio.File.new_for_path(
+                                `${Me.dir.get_path()}/icons/soundbar-frames/frame_${String(idx + 1).padStart(3, "0")}.png`
+                            )
+                        }));
+                    }
                     idx = (idx + 1) % FRAME_COUNT;
                     return GLib.SOURCE_CONTINUE;
                 });
-                
-                this._currentOverlay = { wrapper, timeoutId };
 
-                //woerking
+                this._currentOverlay = { wrapper, timeoutId: overlayTimeout };
+
+                // 4) Reset styles on all other rows
                 this.resultsBox.get_children().forEach(child => {
                     child._songNameActor.set_style(child._songNameActor._origStyle);
                 });
-               
-                this._currentPlayingId = r.id;
 
+                // 5) Mark this ID as currently playing
+                this._currentPlayingId = r.id;
                 songName.set_style("font-weight:bold; font-size:12pt; color:#38c739;");
 
-                let audioUrl = r.downloadUrl?.find(d=>d.quality==="320kbps")?.link;
+                // 6) Play audio
+                let audioUrl = r.downloadUrl?.find(d => d.quality === "320kbps")?.link;
                 if (!audioUrl) return;
                 this.songLabel.set_text(r.name);
                 this.artistLabel.set_text(artist);
-                this.artwork.set_style(`width:270px; height:150px; background-color:#ccc; background-image:url("${imgBig}"); background-size:cover;`);
+                this.artwork.set_style(`
+                    width:270px; height:150px;
+                    background-color:#ccc;
+                    background-image:url("${imgBig}");
+                    background-size:cover;
+                `);
                 this._playAudio(audioUrl);
             });
 
-            // animate in & lazy-load image
-            GLib.timeout_add(GLib.PRIORITY_DEFAULT, i * 50, () => {
-                row.ease({ opacity:255, translation_y:0, duration:300, mode:Clutter.AnimationMode.EASE_IN_OUT_CUBIC });
-                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
-                    if (imgSmall) {
-                      cover.set_style(`background-image: url("${imgSmall}");
-                                       background-size: cover;
-                                       width:48px; height:48px;
-                                       border-radius:4px;
-                                       margin-right:10px;`);
-                    }
-                    return GLib.SOURCE_REMOVE;
-                  });
-                  
+            // 7) Schedule “animate in” + “lazy-load image” timeouts and track them
+            let startId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, i * 50, () => {
+                row.ease({ opacity: 255, translation_y: 0, duration: 300, mode: Clutter.AnimationMode.EASE_IN_OUT_CUBIC });
+                if (imgSmall) {
+                    let imgId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
+                        cover.set_style(`
+                            background-image: url("${imgSmall}");
+                            background-size: cover;
+                            width:48px; height:48px;
+                            border-radius:4px;
+                            margin-right:10px;
+                        `);
+                        return GLib.SOURCE_REMOVE;
+                    });
+                    this._rowTimeouts.push(imgId);
+                }
                 return GLib.SOURCE_REMOVE;
             });
+            this._rowTimeouts.push(startId);
 
             this.resultsBox.add_child(row);
         });
 
+        // Adjust scrollView height
         GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
             let h = Math.min(results.length * 60, 250);
-            this.scrollView.ease({ height: h, duration:250, mode:Clutter.AnimationMode.EASE_OUT_QUAD });
+            this.scrollView.ease({ height: h, duration: 250, mode: Clutter.AnimationMode.EASE_OUT_QUAD });
             return GLib.SOURCE_REMOVE;
         });
     }
@@ -390,15 +461,22 @@ class Indicator extends PanelMenu.Button {
 
     _startTrackingProgress() {
         if (!this.currentPlayer) return;
-        if (this.progressId) GLib.source_remove(this.progressId);
+        if (this.progressId) {
+            GLib.source_remove(this.progressId);
+        }
         this.progressId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 500, () => {
             let [okP, pos] = this.currentPlayer.query_position(Gst.Format.TIME);
             let [okD, dur] = this.currentPlayer.query_duration(Gst.Format.TIME);
             if (okP && okD && dur > 0) {
                 this.seekBar.value = pos / dur;
-                let cs = Math.floor(pos / Gst.SECOND), ts = Math.floor(dur / Gst.SECOND);
-                this.currentTimeLabel.set_text(`${String(Math.floor(cs/60)).padStart(2,"0")}:${String(cs%60).padStart(2,"0")}`);
-                this.totalTimeLabel.set_text(`${String(Math.floor(ts/60)).padStart(2,"0")}:${String(ts%60).padStart(2,"0")}`);
+                let cs = Math.floor(pos / Gst.SECOND),
+                    ts = Math.floor(dur / Gst.SECOND);
+                this.currentTimeLabel.set_text(
+                    `${String(Math.floor(cs/60)).padStart(2,"0")}:${String(cs%60).padStart(2,"0")}`
+                );
+                this.totalTimeLabel.set_text(
+                    `${String(Math.floor(ts/60)).padStart(2,"0")}:${String(ts%60).padStart(2,"0")}`
+                );
             }
             return GLib.SOURCE_CONTINUE;
         });
@@ -459,7 +537,7 @@ class Indicator extends PanelMenu.Button {
 // --------------------------------------------------------------------------------
 function fetchSongs(query, session) {
     return new Promise((resolve, reject) => {
-        let url = `https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query=${encodeURIComponent(query)}&limit=40`;
+        let url = `https://jiosaavn-api-privatecvc2.vercel.app/search/songs?query=${encodeURIComponent(query)}&limit=20`;
         let msg = Soup.Message.new("GET", url);
         msg.request_headers.append("User-Agent", "GNOME Shell Extension");
         session.queue_message(msg, (sess, m) => {
