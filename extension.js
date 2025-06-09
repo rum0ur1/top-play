@@ -7,10 +7,6 @@ const PanelMenu = imports.ui.panelMenu;
 const ExtensionUtils = imports.misc.extensionUtils;
 const Me = imports.misc.extensionUtils.getCurrentExtension();
 
-let themeContext = St.ThemeContext.get_for_stage(global.stage);
-let cssFile = Me.dir.get_child('stylesheet.css');
-themeContext.get_theme().load_stylesheet(cssFile);
-
 const GETTEXT_DOMAIN = "my-indicator-extension";
 const _ = ExtensionUtils.gettext;
 
@@ -47,6 +43,9 @@ class Indicator extends PanelMenu.Button {
         this._spinnerBin = null;
         this._currentOverlay = null;    // { wrapper, timeoutId }
         this._currentPlayingId = null;  // ID of the currently playing song
+
+        this._renderedResults = [];
+        this._currentIndex = -1;
 
         this._rowTimeouts = [];         // track all per-row timeouts
 
@@ -95,9 +94,20 @@ class Indicator extends PanelMenu.Button {
             style: "margin:5px;",
         });
         this.prevBtn = this._makeButton("media-skip-backward-symbolic");
+        this.prevBtn.connect("clicked", () => {
+            this._artworkDirection = 'prev';
+            this._playPrevious()
+        });
+
         this.playBtn = this._makeButton("media-playback-start-symbolic");
-        this.nextBtn = this._makeButton("media-skip-forward-symbolic");
         this.playBtn.connect("clicked", () => this._togglePlayPause());
+
+        this.nextBtn = this._makeButton("media-skip-forward-symbolic");
+        this.nextBtn.connect("clicked", () => {
+            this._artworkDirection = 'next';
+            this._playNext()
+        });
+
         this.controlsBox.add_child(this.prevBtn);
         this.controlsBox.add_child(this.playBtn);
         this.controlsBox.add_child(this.nextBtn);
@@ -245,8 +255,13 @@ class Indicator extends PanelMenu.Button {
     }
 
     _renderResults(results) {
+
+        this._renderedResults = results;
+
+
         // 1) Cancel previous row-level timeouts and clear rows
         this._clearAllRows();
+        this._currentResults = results; // ← Save it globally
 
         // 2) Create each result row
         results.forEach((r, i) => {
@@ -347,6 +362,9 @@ class Indicator extends PanelMenu.Button {
 
             // Click handler: start playback + animated overlay
             row.connect("button-press-event", () => {
+
+                this._currentIndex = i;
+
                 // 1) Clear existing overlay if any
                 if (this._currentOverlay) {
                     GLib.source_remove(this._currentOverlay.timeoutId);
@@ -402,12 +420,37 @@ class Indicator extends PanelMenu.Button {
                 if (!audioUrl) return;
                 this.songLabel.set_text(r.name);
                 this.artistLabel.set_text(artist);
-                this.artwork.set_style(`
-                    width:270px; height:150px;
-                    background-color:#ccc;
-                    background-image:url("${imgBig}");
-                    background-size:cover;
-                `);
+
+                let offsetX = (this._artworkDirection === 'next') ? 15 : -15;
+
+               // Fade out & slide horizontally by –offsetX (so it moves off in the correct direction)
+                this.artwork.ease({
+                    opacity: 0,
+                    translation_x: -offsetX,
+                    duration: 200,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    onComplete: () => {
+                        // Swap the cover‐art image
+                        this.artwork.set_style(`
+                            width:270px; height:150px;
+                            background-color:#ccc;
+                            background-image:url("${imgBig}");
+                            background-size:cover;
+                        `);
+
+                        // Position it offscreen on the opposite side (+offsetX)
+                        this.artwork.set_translation(offsetX, 0, 0);
+
+                        // Slide back in (to x = 0) and fade in
+                        this.artwork.ease({
+                            opacity: 255,
+                            translation_x: 0,
+                            duration: 250,
+                            mode: Clutter.AnimationMode.EASE_IN_OUT_QUAD
+                        });
+                    }
+                });
+
                 this._playAudio(audioUrl);
             });
 
@@ -468,6 +511,14 @@ class Indicator extends PanelMenu.Button {
             let [okP, pos] = this.currentPlayer.query_position(Gst.Format.TIME);
             let [okD, dur] = this.currentPlayer.query_duration(Gst.Format.TIME);
             if (okP && okD && dur > 0) {
+                if (pos >= dur - Gst.MSECOND * 200) {  
+                    GLib.source_remove(this.progressId);
+                    this.progressId = null;
+                    this.currentPlayer.set_state(Gst.State.NULL); 
+                    this._artworkDirection = 'next';
+                    this._playNext(); 
+                    return GLib.SOURCE_REMOVE;
+                }
                 this.seekBar.value = pos / dur;
                 let cs = Math.floor(pos / Gst.SECOND),
                     ts = Math.floor(dur / Gst.SECOND);
@@ -492,6 +543,41 @@ class Indicator extends PanelMenu.Button {
             this.currentPlayer.set_state(Gst.State.PLAYING);
             this.isPlaying = true;
             this.playBtn.child.icon_name = "media-playback-pause-symbolic";
+        }
+    }
+
+    _playPrevious() {
+        if (!this._renderedResults || this._renderedResults.length === 0) return;
+
+        let prevIndex = this._currentIndex - 1;
+        if (prevIndex < 0) {
+            prevIndex = this._renderedResults.length - 1; // Loop to last song
+        }
+
+        let prevSong = this._renderedResults[prevIndex];
+        if (!prevSong) return;
+
+        // Simulate a click on the row to reuse existing play logic
+        let row = this.resultsBox.get_child_at_index(prevIndex);
+        if (row) {
+            row.emit("button-press-event", null);
+        }
+    }
+
+    _playNext() {
+        if (!this._renderedResults || this._renderedResults.length === 0) return;
+        let nextIndex = this._currentIndex + 1;
+        if (nextIndex >= this._renderedResults.length) {
+            nextIndex = 0; // Loop back to start
+        }
+
+        let nextSong = this._renderedResults[nextIndex];
+        if (!nextSong) return;
+
+        // Simulate a click on the row to reuse the existing logic
+        let row = this.resultsBox.get_child_at_index(nextIndex);
+        if (row) {
+            row.emit("button-press-event", null);
         }
     }
 
@@ -564,6 +650,10 @@ class Extension {
     }
 
     enable() {
+        let themeContext = St.ThemeContext.get_for_stage(global.stage);
+        let cssFile = Me.dir.get_child('stylesheet.css');
+        themeContext.get_theme().load_stylesheet(cssFile);
+
         // Init GStreamer safely
         if (!Gst.is_initialized()) {
             let [ok] = Gst.init_check(null, null);
@@ -590,6 +680,10 @@ class Extension {
             this._session.abort();
             this._session = null;
         }
+
+        // CLEAN UP PIXBUFS:
+        framePixbufs.forEach(p => p && p.unref && p.unref());
+        framePixbufs = [];
     }
 }
 
