@@ -1,4 +1,4 @@
-const { GdkPixbuf, GObject, St, Clutter, Gio, GLib } = imports.gi;
+const { GdkPixbuf, GObject, St, Clutter, Gio, GLib, Pango } = imports.gi;
 const Slider = imports.ui.slider.Slider;
 const Soup = imports.gi.Soup;
 const Gst = imports.gi.Gst;
@@ -6,9 +6,13 @@ const Main = imports.ui.main;
 const PanelMenu = imports.ui.panelMenu;
 const ExtensionUtils = imports.misc.extensionUtils;
 const Me = imports.misc.extensionUtils.getCurrentExtension();
-
+const PopupMenu = imports.ui.popupMenu;
+const PolicyType = St.PolicyType;
 const GETTEXT_DOMAIN = "my-indicator-extension";
 const _ = ExtensionUtils.gettext;
+// const RECENT_FILE = GLib.build_filenamev([Me.path, "recently-played.json"]);
+
+const DATA_FILE = `${Me.path}/data.json`;
 
 const FRAME_COUNT = 30;
 var framePixbufs = [];
@@ -43,11 +47,17 @@ class Indicator extends PanelMenu.Button {
         this._spinnerBin = null;
         this._currentOverlay = null;    // { wrapper, timeoutId }
         this._currentPlayingId = null;  // ID of the currently playing song
-
         this._renderedResults = [];
         this._currentIndex = -1;
-
         this._rowTimeouts = [];         // track all per-row timeouts
+        // this.recentlyPlayed = this._loadRecentlyPlayed();
+
+        //load the data 
+        this._data = this._loadData();
+        this._likedSongs = this._data.liked || [];
+        this._currentMode = "search"; // or "liked"
+
+        this._menuManager = new PopupMenu.PopupMenuManager(this.actor);
 
         // Top-bar icon
         this.icon = new St.Icon({
@@ -148,8 +158,32 @@ class Indicator extends PanelMenu.Button {
             style_class: "search-entry",
             track_hover: true,
         });
+        
         this.menu.box.add(searchEntry);
 
+        //playlist tabs
+        // 1. Create the BoxLayout as before
+        // Create your tab bar
+        this._tabBox = new St.BoxLayout({
+            vertical: false,
+            style: 'margin: 6px; margin-top: 0; spacing: 5px;',
+            x_expand: true
+        });
+
+        // Wrap it in a ScrollView
+        this._scrollView = new St.ScrollView({
+            x_expand: true,
+            y_expand: false,
+            hscrollbar_policy: PolicyType.AUTOMATIC,
+            vscrollbar_policy: PolicyType.NEVER,
+            overlay_scrollbars: false
+        });
+
+        this._scrollView.add_actor(this._tabBox);
+        this.menu.box.add(this._scrollView);
+
+        this._renderPlaylistTabs();
+        
         this.resultsBox = new St.BoxLayout({ vertical: true });
         this.scrollView = new St.ScrollView({
             style: "max-height:250px; margin:5px;",
@@ -181,6 +215,7 @@ class Indicator extends PanelMenu.Button {
             this._searchTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 350, () => {
                 fetchSongs(q, this._session)
                     .then(results => {
+                        this._currentMode = "search";
                         this._renderResults(results);
                         this._destroySpinner();
                     })
@@ -201,6 +236,60 @@ class Indicator extends PanelMenu.Button {
         }
         this._rowTimeouts = [];
         this.resultsBox.destroy_all_children();
+    }
+
+    _renderPlaylistTabs() {
+
+        this._tabBox.destroy_all_children();
+
+         this.likedBtn = new St.Button({
+            child: new St.Icon({
+                icon_name: "emblem-favorite-symbolic",
+                style: "icon-size: 16px; color: #e74c3c;",
+            }),
+            style_class: "square-icon-button",
+            x_expand: false,
+        });
+        this._tabBox.add_child(this.likedBtn);
+        this.likedBtn.connect("clicked", () => {
+            this._currentMode = "liked";
+            this._tabBox.get_children().forEach(child => {
+                if (child.style_class !== 'square-icon-button') {
+                    child.set_style_class_name('tab-button');
+                }
+            });
+            this._renderResults(this._likedSongs);
+        });
+
+
+        for (let name in this._data.playlists) {
+            
+             let lbl = new St.Label({
+                text: name,
+                y_align: Clutter.ActorAlign.CENTER,
+            });
+
+            lbl.clutter_text.set_ellipsize(Pango.EllipsizeMode.NONE);
+            lbl.clutter_text.set_line_wrap(false);
+            let playlistBtn = new St.Button({
+                child: lbl,
+                style_class: 'tab-button',
+                x_expand: false
+            });
+            playlistBtn.connect("clicked", () => {
+                 this._tabBox.get_children().forEach(child => {
+                   if (child.style_class !== 'square-icon-button') {
+                        child.set_style_class_name('tab-button');
+                    }
+                });
+                playlistBtn.set_style_class_name('tab-button-active')
+                this._currentMode = "playlist";
+                this._currentPlaylist = name;
+                this._renderResults(this._data.playlists[name]);
+            });
+
+            this._tabBox.add_child(playlistBtn);
+        }
     }
 
     // Remove timeouts/loops on destroy
@@ -258,13 +347,25 @@ class Indicator extends PanelMenu.Button {
 
         this._renderedResults = results;
 
-
         // 1) Cancel previous row-level timeouts and clear rows
         this._clearAllRows();
         this._currentResults = results; // ← Save it globally
 
+        if (results.length === 0 && this._currentMode === "liked") {
+            this._clearAllRows(); // In case old stuff exists
+            let emptyLabel = new St.Label({
+                text: "No liked songs yet!",
+                style: "font-size:10pt; color:#888; margin:12px;",
+                x_align: Clutter.ActorAlign.CENTER,
+                y_align: Clutter.ActorAlign.CENTER
+            });
+            this.resultsBox.add_child(emptyLabel);
+            return;
+        }
+
         // 2) Create each result row
         results.forEach((r, i) => {
+          
             let artist = r.primaryArtists || "Unknown Artist";
             let dur = r.duration || 0;
             let min = Math.floor(dur / 60);
@@ -272,6 +373,8 @@ class Indicator extends PanelMenu.Button {
             let durationText = `${min}:${sec.toString().padStart(2, "0")}`;
             let imgSmall = r.image?.find(i => i.quality === "150x150")?.link;
             let imgBig = r.image?.find(i => i.quality === "500x500")?.link;
+            let isLiked = this._likedSongs.some(s => s.id === r.id);
+
 
             // Cover placeholder
             let cover = new St.BoxLayout({
@@ -279,7 +382,7 @@ class Indicator extends PanelMenu.Button {
                 y_align: Clutter.ActorAlign.CENTER,
                 vertical: false,
                 style_class: "cover-art",
-                style: `width:48px; height:48px;
+                style: `width:36px; height:36px;
                         border-radius:4px;
                         margin-right:10px;
                         background-color:#666;`
@@ -294,18 +397,194 @@ class Indicator extends PanelMenu.Button {
             songName._origStyle = songName.get_style();
             let artistName = new St.Label({
                 text: artist,
-                style: "font-size:9pt; color:#aaa;",
+                style: "font-size:8pt; color:#aaa;",
             });
             textBox.add_child(songName);
             textBox.add_child(artistName);
 
-            // Duration label
             let durationLabel = new St.Label({
                 text: durationText,
-                style: "font-size:9pt; color:#ccc; margin-left:10px;",
-                x_expand: false,
-                x_align: Clutter.ActorAlign.END
+                style: "font-size: 8pt; color:#888;",
             });
+            textBox.add_child(durationLabel);
+
+            //more buttons
+            let rightActions = new St.BoxLayout({
+                vertical: false,
+                x_align: Clutter.ActorAlign.END,
+                x_expand: false,
+                y_align: Clutter.ActorAlign.CENTER, // Ensures vertical centering
+                style: "spacing: 3px;", // optional for space between buttons
+            });
+
+            let liked = this._data.liked.some(s => s.id === r.id);
+            let heartIcon = new St.Icon({
+                // icon_name: isLiked ? "emblem-favorite-symbolic" : "emblem-favorite-outline-symbolic", // fallback: "non-starred"
+                gicon: Gio.icon_new_for_string(`${Me.path}/icons/heart/${liked ? "liked.svg" : "not_liked.svg"}`),
+                icon_size: 16,
+                style_class: "heart-icon",
+            });
+
+            // Heart button
+            let heartBtn = new St.Button({
+                style_class: "heart-button",
+                child: heartIcon,
+                reactive: true,
+                can_focus: true,
+                track_hover: true,
+            });
+
+            heartBtn.connect("clicked", () => {
+                if (liked) {
+                    this._data.liked = this._data.liked.filter(s => s.id !== r.id);
+                    this._likedSongs = this._likedSongs.filter(s => s.id !== r.id);
+                } else {
+                    this._data.liked.push(r);
+                    this._likedSongs.push(r);
+                }
+                this._saveData(this._data);
+
+                // Flip flag
+                liked = !liked;
+
+                // Update the heart icon
+                heartIcon.set_gicon(Gio.icon_new_for_string(
+                    `${Me.path}/icons/heart/${liked ? "liked.svg" : "not_liked.svg"}`
+                ));
+
+                // *** ALSO update the popup‑menu item label & icon ***
+                likeItem.label.set_text(
+                    liked ? "Remove from liked songs" : "Add to liked songs"
+                );
+                likeItem.setIcon("emblem-favorite");
+
+                  // If you’re in liked‑view and just un‑liked, remove the row
+                if (this._currentMode === "liked" && !liked) {
+                    row.ease({
+                    translation_x: -200, opacity: 0, duration: 300, mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    onComplete: () => {
+                        this.resultsBox.remove_child(row)
+                        this._renderResults(this._likedSongs);
+                    }
+                    });
+                }
+            });
+
+            // 3-dot "More" menu
+            let moreBtn = new St.Button({
+                style_class: "more-button",
+                child: new St.Label({
+                    text: "⋮",
+                    style: "font-size: 12pt; font-weight:bold;",
+                }),
+                reactive: true,
+                can_focus: true,
+                track_hover: true,
+            });
+
+            // Create the menu and manager
+            let menu = new PopupMenu.PopupMenu(moreBtn, 0.5, St.Side.TOP);
+            menu.actor.set_style(`
+                padding: 0px; margin: 0px;background: transparent; border: none;
+            `);
+            menu.box.set_style(`
+                border: 1px solid #444; border-radius: 8px; padding: 0px;  width: 100pt;
+            `);
+            this._menuManager.addMenu(menu);
+
+            let likeItem = new PopupMenu.PopupImageMenuItem(
+                liked ? "Remove from liked songs" : "Add to liked songs","emblem-favorite" ,{}
+            );
+            removeIconPadding(likeItem);
+            likeItem.connect("activate", () => {
+                // Exactly the same toggling logic:
+                if (liked) {
+                    this._data.liked = this._data.liked.filter(s => s.id !== r.id);
+                    this._likedSongs = this._likedSongs.filter(s => s.id !== r.id);
+                } else {
+                    this._data.liked.push(r);
+                    this._likedSongs.push(r);
+                }
+                this._saveData(this._data);
+                liked = !liked;
+
+                // Update both UI pieces
+                heartIcon.set_gicon(Gio.icon_new_for_string(
+                    `${Me.path}/icons/heart/${liked ? "liked.svg" : "not_liked.svg"}`
+                ));
+                likeItem.label.set_text(
+                    liked ? "Remove from liked songs" : "Add to liked songs"
+                );
+                likeItem.setIcon("emblem-favorite");
+
+                // Close menu, optionally remove row in liked‑view
+                menu.close();
+                if (this._currentMode === "liked" && !liked) {
+                    row.ease({
+                    translation_x: -200, opacity: 0, duration: 300, mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                    onComplete: () => this.resultsBox.remove_child(row)
+                    });
+                }
+            });
+            menu.addMenuItem(likeItem);
+
+            if (this._currentMode === "playlist") {
+                let removeItem = new PopupMenu.PopupImageMenuItem("Remove from Playlist", 'list-remove', {});
+                 removeIconPadding(removeItem);
+                removeItem.connect("activate", () => {
+                    row.ease({
+                        translation_x: -200, opacity: 0, duration: 300, mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                        onComplete: () => {
+                            this._data.playlists[this._currentPlaylist] = this._data.playlists[this._currentPlaylist].filter(s => s.id !== r.id);
+                            this._saveData(this._data);
+                            this._renderResults(this._data.playlists[this._currentPlaylist]);
+                        } 
+                    });
+                });
+                menu.addMenuItem(removeItem);
+            } else{
+                let playlistItem = new PopupMenu.PopupImageMenuItem('Add to playlist', 'list-add', {});
+                removeIconPadding(playlistItem);
+                playlistItem.connect('activate', () => {
+                   this._showPlaylistPopup(r);
+                    menu.close();
+                });
+                menu.addMenuItem(playlistItem);
+            }
+
+            let queueItem = new PopupMenu.PopupImageMenuItem('Add to Queue (soon)', 'gtk-index', {});
+            removeIconPadding(queueItem);
+            menu.addMenuItem(queueItem);
+
+            let downloadItem = new PopupMenu.PopupImageMenuItem('Download (soon)', 'emblem-downloads', {});
+            removeIconPadding(downloadItem);
+            menu.addMenuItem(downloadItem);
+
+            function removeIconPadding(item) {
+                item.actor.set_style('padding-left: 2px;');
+                
+                // Safely find the icon box (first child of the actor)
+                let children = item.actor.get_children();
+                if (children.length >= 2) {
+                    let iconBox = children[0]; // usually the icon container
+                    iconBox.set_width(0);
+                    iconBox.set_style('margin: 0px; padding: 0px;');
+                }
+            }
+
+            Main.uiGroup.add_actor(menu.actor);
+            menu.actor.hide();
+            // moreBtn.remove_style_class_name("active");
+
+            // Show/hide on click
+            moreBtn.connect('clicked', () => {
+                log(`More clicked for: ${r.title}`);
+                menu.toggle();
+                // moreBtn.add_style_class_name("active");
+            });
+            rightActions.add_child(heartBtn);
+            rightActions.add_child(moreBtn);
+            
 
             // Row container
             let row = new St.BoxLayout({
@@ -319,6 +598,9 @@ class Indicator extends PanelMenu.Button {
             row.add_child(cover);
             row.add_child(textBox);
             row.add_child(durationLabel);
+            let spacer = new St.Widget({ x_expand: true });
+            row.add_child(spacer); // fills space in between
+            row.add_child(rightActions);
 
             // Store reference to reset style later
             row._songNameActor = songName;
@@ -327,21 +609,26 @@ class Indicator extends PanelMenu.Button {
             if (this._currentPlayingId === r.id) {
                 songName.set_style("font-weight:bold; font-size:12pt; color:#38c739;");
 
-                let image = new St.Icon({
-                    gicon: null,
-                    icon_size: 24,
-                    x_align: Clutter.ActorAlign.CENTER,
-                    y_align: Clutter.ActorAlign.CENTER,
-                });
-                let wrapper = new St.Bin({
+                let artOverlay = new St.Widget({
+                    layout_manager: new Clutter.BinLayout(),
+                    width: 36,
+                    height: 36,
                     x_expand: true,
                     y_expand: true,
+                    reactive: false,
+                });
+                let overlaySoundBarIcon = new St.Icon({
+                    gicon: Gio.icon_new_for_string(soundbarPath),
+                    style_class: 'overlay-icon',  // optional CSS for size
+                });
+                let centeredBin = new St.Bin({
                     x_align: Clutter.ActorAlign.CENTER,
                     y_align: Clutter.ActorAlign.CENTER,
-                    style: "width:26px; height:26px; padding: 6px; border-radius:4px; background-color: rgba(0, 0, 0, 0.49)",
+                    child: overlaySoundBarIcon,
                 });
-                wrapper.set_child(image);
-                cover.add_child(wrapper);
+                artOverlay.add_child(centeredBin);
+                cover.remove_all_children();
+                cover.add_child(artOverlay);
 
                 let idx = 0;
                 let overlayTimeout = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 30, () => {
@@ -380,11 +667,11 @@ class Indicator extends PanelMenu.Button {
                     y_align: Clutter.ActorAlign.CENTER,
                 });
                 let wrapper = new St.Bin({
-                    x_expand: true,
-                    y_expand: true,
+                    // x_expand: true,
+                    // y_expand: true,
                     x_align: Clutter.ActorAlign.CENTER,
                     y_align: Clutter.ActorAlign.CENTER,
-                    style: "width:26px; height:26px; padding: 6px; border-radius:4px; background-color: rgba(0, 0, 0, 0.49)",
+                    style: "width:18px; height:18px; padding: 6px; margin-left:3px; border-radius:3px; background-color: rgba(0, 0, 0, 0.49)",
                 });
                 wrapper.set_child(image);
                 cover.add_child(wrapper);
@@ -452,7 +739,7 @@ class Indicator extends PanelMenu.Button {
                 });
 
                 this._playAudio(audioUrl);
-            });
+            }); 
 
             // 7) Schedule “animate in” + “lazy-load image” timeouts and track them
             let startId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, i * 50, () => {
@@ -462,7 +749,7 @@ class Indicator extends PanelMenu.Button {
                         cover.set_style(`
                             background-image: url("${imgSmall}");
                             background-size: cover;
-                            width:48px; height:48px;
+                            width:36px; height:36px;
                             border-radius:4px;
                             margin-right:10px;
                         `);
@@ -616,6 +903,195 @@ class Indicator extends PanelMenu.Button {
             this._spinnerIcon = null;
         }
     }
+
+    _loadData() {
+        try {
+            if (!GLib.file_test(DATA_FILE, GLib.FileTest.EXISTS))
+                return { liked: [] };
+
+            let raw = GLib.file_get_contents(DATA_FILE)[1];
+            return JSON.parse(imports.byteArray.toString(raw));
+        } catch (e) {
+            logError(e);
+            return { liked: [] };
+        }
+    }
+
+    _saveData(data) {
+        try {
+            GLib.file_set_contents(DATA_FILE, JSON.stringify(data));
+        } catch (e) {
+            logError(e);
+        }
+    }
+  
+    _showPlaylistPopup(song) {
+        // Remove any existing popup
+        if (this._playlistPopup) {
+            this.menu.box.remove_child(this._playlistPopup);
+            this._playlistPopup = null;
+        }
+
+        // Create the container
+        this._playlistPopup = new St.BoxLayout({
+            vertical: true,
+            style_class: 'playlist-popup',
+            x_expand: true,
+            y_expand: true,
+            style: 'padding: 12px; background-color: #1e1e1e; border-radius: 8px; border: 1px solid #444;',
+            x_align: Clutter.ActorAlign.CENTER,
+            y_align: Clutter.ActorAlign.CENTER,
+        });
+
+        // We'll track initial state and the button itself
+        let checkboxButtons = {};
+        let initialState    = {};
+
+        // 1) Build one row per playlist
+        for (let name in this._data.playlists) {
+            let row = new St.BoxLayout({ 
+                vertical: false,
+                x_expand: true,
+                reactive: true,
+                can_focus: true,
+                track_hover: true,
+            });
+            row.set_style_class_name("the-hover");
+            // Determine if song is already in this playlist
+            let inPlaylist = this._data.playlists[name].some(s => s.id === song.id);
+            initialState[name] = inPlaylist;
+
+            // Your button-as-checkbox
+            let checkbox = new St.Button({
+                style_class: 'playlist-checkbox',
+                label: inPlaylist ? '✅' : '⬜',
+                // `${Me.path}/icons/check/checkbox.svg`
+                // `${Me.path}/icons/check/checkbox-empty.svg`
+                can_focus: true,
+            });
+            checkbox._isChecked = inPlaylist;
+            checkbox.connect('clicked', () => {
+                checkbox._isChecked = !checkbox._isChecked;
+                checkbox.label = (checkbox.label === '✅') ? '⬜' : '✅';
+            });
+
+            // Label
+            let label = new St.Label({
+                text: name,
+                x_expand: true,
+                reactive: true,
+                can_focus: true,
+                track_hover: true,
+               
+            });
+            label.set_style_class_name("play-name")
+            label.connect('button-press-event', () => {
+                checkbox._isChecked = !checkbox._isChecked;
+                checkbox.label = checkbox._isChecked ? '✅' : '⬜';
+            });
+
+            // Delete button
+            let deleteBtn = new St.Button({
+                child: new St.Label({ text: '🗑️' }),
+                style: 'margin-left: 10px;',
+            });
+            deleteBtn.connect('clicked', () => {
+                delete this._data.playlists[name];
+                this._saveData(this._data);
+                this._renderPlaylistTabs(); 
+                this._showPlaylistPopup(song); // refresh
+            });
+
+            row.add_child(checkbox);
+            row.add_child(label);
+            row.add_child(deleteBtn);
+
+            this._playlistPopup.add_child(row);
+
+            checkboxButtons[name] = checkbox;
+        }
+
+        // 2) “Create new playlist” row
+        let createBox = new St.BoxLayout({ vertical: false, style: 'margin-top: 10px; spacing:6px' });
+        let playlistInput = new St.Entry({
+            hint_text: 'New playlist name',
+            style_class: 'playlist-entry',
+            x_expand: true,
+        });
+        let createBtn = new St.Button({
+            label: 'Create',
+            style_class: 'playlist-create-button',
+        });
+        createBtn.connect('clicked', () => {
+            let newName = playlistInput.get_text().trim();
+            if (newName && !(newName in this._data.playlists)) {
+                this._data.playlists[newName] = [];
+                this._saveData(this._data);
+                this._renderPlaylistTabs(); 
+                this._showPlaylistPopup(song);
+            }
+        });
+        createBox.add_child(playlistInput);
+        createBox.add_child(createBtn);
+        this._playlistPopup.add_child(createBox);
+
+        // 3) Cancel / Add buttons
+        let buttonRow = new St.BoxLayout({ vertical: false, style: 'margin-top: 10px; spacing:6px' });
+
+        let cancelBtn = new St.Button({
+            label: 'Cancel',
+            x_expand: true,
+            style_class: 'playlist-cancel-button',
+        });
+        cancelBtn.connect('clicked', () => {
+            this.menu.box.remove_child(this._playlistPopup);
+            this._playlistPopup = null;
+        });
+
+        let addBtn = new St.Button({
+            label: 'Add',
+            x_expand: true,
+            style_class: 'playlist-add-button',
+        });
+        addBtn.connect('clicked', () => {
+            for (let name in checkboxButtons) {
+                let cb = checkboxButtons[name];
+                let was = initialState[name];
+                let now = (cb.label === '✅');
+                // let now = cb._isChecked;
+
+                // If it was unchecked and now checked => add
+                if (!was && now) {
+                    this._data.playlists[name].push(song);
+                }
+                // If it was checked and now unchecked => remove
+                else if (was && !now) {
+                    this._data.playlists[name] =
+                        this._data.playlists[name].filter(s => s.id !== song.id);
+                }
+            }
+
+            this._saveData(this._data);
+            this.menu.box.remove_child(this._playlistPopup);
+            this._playlistPopup = null;
+        });
+
+        buttonRow.add_child(cancelBtn);
+        buttonRow.add_child(addBtn);
+        this._playlistPopup.add_child(buttonRow);
+
+        // 4) Finally, add it to *your* extension panel menu
+        this.menu.box.add_child(this._playlistPopup);
+
+        // Animate in if you like
+        this._playlistPopup.opacity = 0;
+        this._playlistPopup.ease({
+            opacity: 255,
+            duration: 200,
+            mode: Clutter.AnimationMode.EASE_IN_OUT_CUBIC,
+        });
+    }
+
 });
 
 // --------------------------------------------------------------------------------
@@ -667,6 +1143,7 @@ class Extension {
         // Instantiate indicator with our session
         this._indicator = new Indicator(this._session);
         Main.panel.addToStatusArea(this._uuid, this._indicator);
+
     }
 
     disable() {
